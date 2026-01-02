@@ -6,9 +6,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from matplotlib.colors import LogNorm
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
 
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
@@ -43,6 +45,18 @@ app.add_middleware(
 
 
 # ------------------------------
+# MODELOS PYDANTIC
+# ------------------------------
+
+class PuntoRuta(BaseModel):
+    lat: float
+    lng: float
+
+class RutaRequest(BaseModel):
+    ruta: List[PuntoRuta]
+
+
+# ------------------------------
 # CREAR TARGET (alto riesgo)
 # ------------------------------
 
@@ -72,7 +86,7 @@ def train_model(csv_path: str):
         "latitud_accidente", "longitud_accidente",
         "tipo_accidente", "gravedad", "clima",
         "numero_victimas", "cantón", "provincia"
-    ]].copy()  # Usar .copy() para evitar SettingWithCopyWarning
+    ]].copy()
 
     y = df["alto_riesgo"]
 
@@ -199,6 +213,23 @@ def risk_grid(df: pd.DataFrame, cell_size=0.03):
 # FASTAPI ENDPOINTS
 # ======================================================
 
+@app.get("/")
+def root():
+    return {
+        "message": "API de Predicción de Riesgo de Accidentes",
+        "version": "1.0",
+        "endpoints": {
+            "upload": "/upload-csv/",
+            "train": "/train/",
+            "predict": "/predict/",
+            "predict_ruta": "/predict-ruta/",
+            "model_status": "/model-status/",
+            "heatmap": "/heatmap/",
+            "risk_grid": "/risk-grid/"
+        }
+    }
+
+
 @app.post("/upload-csv/")
 async def upload_csv(file: UploadFile = File(...)):
     if not file.filename.endswith(".csv"):
@@ -207,7 +238,8 @@ async def upload_csv(file: UploadFile = File(...)):
     path = os.path.join(DATA_FOLDER, file.filename)
 
     with open(path, "wb") as f:
-        f.write(await file.read())
+        contents = await file.read()
+        f.write(contents)
 
     return {"msg": "CSV subido", "filename": file.filename}
 
@@ -227,6 +259,64 @@ def predict(payload: dict):
         return predict_row(payload)
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.post("/predict-ruta/")
+def predict_ruta(request: RutaRequest):
+    """
+    Recibe una ruta como lista de puntos con lat/lng
+    """
+    # VERIFICAR SI EL MODELO EXISTE
+    if not os.path.exists(MODEL_PATH):
+        raise HTTPException(
+            status_code=400, 
+            detail="El modelo no ha sido entrenado aún. Por favor, entrena el modelo primero desde la sección 'Entrenar IA'."
+        )
+    
+    try:
+        model = load_model()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al cargar el modelo: {str(e)}"
+        )
+    
+    resultados = []
+    
+    for punto in request.ruta:
+        payload = {
+            "latitud_accidente": punto.lat,
+            "longitud_accidente": punto.lng,
+            "numero_victimas": 0,
+            "tipo_accidente": "ruta",
+            "gravedad": "leve",
+            "clima": "normal",
+            "cantón": "Cuenca",
+            "provincia": "Azuay"
+        }
+        try:
+            resultado = predict_row(payload)
+            resultados.append(resultado)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error en la predicción: {str(e)}"
+            )
+    
+    return {"resultados": resultados}
+
+
+@app.get("/model-status/")
+def model_status():
+    """
+    Retorna el estado del modelo
+    """
+    exists = os.path.exists(MODEL_PATH)
+    return {
+        "model_trained": exists,
+        "model_path": MODEL_PATH,
+        "message": "Modelo entrenado y listo" if exists else "Modelo no entrenado. Entrena el modelo primero."
+    }
 
 
 @app.get("/heatmap/")
@@ -255,3 +345,37 @@ def riskgrid(csv_filename: str):
     grid = risk_grid(df)
 
     return JSONResponse({"cells": grid})
+
+
+# ------------------------------
+# Rutas seguras (opcional)
+# ------------------------------
+@app.get("/rutas_seguras/")
+def rutas_seguras(destino: str, csv_filename: str = "accidentes_sinteticos_ecuador_cuen.csv"):
+    path = os.path.join(DATA_FOLDER, csv_filename)
+    if not os.path.exists(path):
+        raise HTTPException(404, "CSV no encontrado")
+    df = pd.read_csv(path)
+    df["alto_riesgo"] = create_target(df)
+    df_seguro = df[df["alto_riesgo"] == 0]
+
+    if df_seguro.empty:
+        raise HTTPException(404, "No hay rutas seguras disponibles")
+
+    rutas = []
+    for i in range(3):
+        rutas.append({
+            "nombre": f"Ruta segura {i+1}",
+            "camino": [
+                {"lat": -0.170653 + i*0.01, "lng": -78.457834 + i*0.01}
+            ]
+        })
+    return JSONResponse(rutas)
+
+
+# ------------------------------
+# Iniciar servidor
+# ------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
