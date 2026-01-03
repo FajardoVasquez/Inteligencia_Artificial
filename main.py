@@ -1,40 +1,15 @@
-import os
-import io
-import joblib
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-from matplotlib.colors import LogNorm
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
+import pandas as pd
+import httpx
+from models import AccidenteRequest, AccidenteResponse, CombinedResponse
+from utils import procesar_csv, combinar_datos
+import io
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+app = FastAPI(title="Sistema de Análisis de Accidentes")
 
-
-# ------------------------------
-# CONFIG
-# ------------------------------
-
-DATA_FOLDER = "data"
-MODEL_PATH = "modelo_riesgo.pkl"
-
-os.makedirs(DATA_FOLDER, exist_ok=True)
-
-
-# ------------------------------
-# FASTAPI APP
-# ------------------------------
-
-app = FastAPI(title="Modelo Riesgo Accidentes Ecuador")
-
+# Configurar CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -43,339 +18,163 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ------------------------------
-# MODELOS PYDANTIC
-# ------------------------------
-
-class PuntoRuta(BaseModel):
-    lat: float
-    lng: float
-
-class RutaRequest(BaseModel):
-    ruta: List[PuntoRuta]
-
-
-# ------------------------------
-# CREAR TARGET (alto riesgo)
-# ------------------------------
-
-def create_target(df: pd.DataFrame):
-    """
-    Regla simple:
-    - gravedad == fatal OR victimas >= 3
-    """
-    df["numero_victimas"] = pd.to_numeric(df["numero_victimas"], errors="coerce").fillna(0)
-    cond_fatal = df["gravedad"].astype(str).str.lower() == "fatal"
-    cond_many = df["numero_victimas"] >= 3
-    return (cond_fatal | cond_many).astype(int)
-
-
-# ------------------------------
-# ENTRENAR MODELO
-# ------------------------------
-
-def train_model(csv_path: str):
-    df = pd.read_csv(csv_path, encoding="utf-8")
-
-    # generar etiqueta
-    df["alto_riesgo"] = create_target(df)
-
-    # features
-    X = df[[
-        "latitud_accidente", "longitud_accidente",
-        "tipo_accidente", "gravedad", "clima",
-        "numero_victimas", "cantón", "provincia"
-    ]].copy()
-
-    y = df["alto_riesgo"]
-
-    # conversión numérica
-    X["latitud_accidente"] = pd.to_numeric(X["latitud_accidente"])
-    X["longitud_accidente"] = pd.to_numeric(X["longitud_accidente"])
-    X["numero_victimas"] = pd.to_numeric(X["numero_victimas"])
-
-    num_cols = ["latitud_accidente", "longitud_accidente", "numero_victimas"]
-    cat_cols = ["tipo_accidente", "gravedad", "clima", "cantón", "provincia"]
-
-    preprocessor = ColumnTransformer([
-        ("num", StandardScaler(), num_cols),
-        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)
-    ])
-
-    pipe = Pipeline([
-        ("prep", preprocessor),
-        ("model", RandomForestClassifier(n_estimators=150, random_state=42))
-    ])
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=y
-    )
-
-    pipe.fit(X_train, y_train)
-
-    joblib.dump(pipe, MODEL_PATH)
-
-    return {"status": "ok", "message": "Modelo entrenado y guardado."}
-
-
-# ------------------------------
-# PREDICT
-# ------------------------------
-
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        raise Exception("Modelo no existe. Entrena primero.")
-    return joblib.load(MODEL_PATH)
-
-
-def predict_row(payload: dict):
-    model = load_model()
-    df = pd.DataFrame([payload])
-
-    # asegurar numéricos
-    df["latitud_accidente"] = pd.to_numeric(df["latitud_accidente"])
-    df["longitud_accidente"] = pd.to_numeric(df["longitud_accidente"])
-    df["numero_victimas"] = pd.to_numeric(df.get("numero_victimas", 0))
-
-    prob = model.predict_proba(df)[0][1]
-    pred = int(prob >= 0.5)
-
-    return {"prob_riesgo": float(prob), "alto_riesgo": bool(pred)}
-
-
-# ------------------------------
-# HEATMAP PNG
-# ------------------------------
-
-def generate_heatmap(df: pd.DataFrame, bins=100):
-    plt.figure(figsize=(10, 8))
-
-    lats = df["latitud_accidente"].values
-    lons = df["longitud_accidente"].values
-
-    plt.hist2d(lons, lats, bins=bins, norm=LogNorm(), cmap="hot")
-    plt.xlabel("Longitud")
-    plt.ylabel("Latitud")
-    plt.title("Mapa de calor de accidentes")
-    plt.colorbar(label="Densidad (log)")
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight")
-    plt.close()
-    buf.seek(0)
-    return buf
-
-
-# ------------------------------
-# GRID DE RIESGO (JSON)
-# ------------------------------
-
-def risk_grid(df: pd.DataFrame, cell_size=0.03):
-    df["alto_riesgo"] = create_target(df)
-
-    min_lat, max_lat = df["latitud_accidente"].min(), df["latitud_accidente"].max()
-    min_lon, max_lon = df["longitud_accidente"].min(), df["longitud_accidente"].max()
-
-    # grilla
-    grid = []
-
-    lat_bins = np.arange(min_lat, max_lat + cell_size, cell_size)
-    lon_bins = np.arange(min_lon, max_lon + cell_size, cell_size)
-
-    for lat_min in lat_bins:
-        for lon_min in lon_bins:
-            lat_max = lat_min + cell_size
-            lon_max = lon_min + cell_size
-
-            cell = df[
-                (df["latitud_accidente"] >= lat_min) &
-                (df["latitud_accidente"] < lat_max) &
-                (df["longitud_accidente"] >= lon_min) &
-                (df["longitud_accidente"] < lon_max)
-            ]
-
-            if len(cell) == 0:
-                continue
-
-            risk_rate = cell["alto_riesgo"].mean()
-
-            grid.append({
-                "centroid": [float(lon_min + cell_size/2), float(lat_min + cell_size/2)],
-                "count": int(len(cell)),
-                "risk_rate": float(risk_rate)
-            })
-
-    return grid
-
-
-# ======================================================
-# FASTAPI ENDPOINTS
-# ======================================================
+API_BASE_URL = "http://localhost:8080/api/accidentes/cercanos"
 
 @app.get("/")
-def root():
+async def root():
     return {
-        "message": "API de Predicción de Riesgo de Accidentes",
+        "message": "API de Análisis de Accidentes de Tránsito",
         "version": "1.0",
         "endpoints": {
-            "upload": "/upload-csv/",
-            "train": "/train/",
-            "predict": "/predict/",
-            "predict_ruta": "/predict-ruta/",
-            "model_status": "/model-status/",
-            "heatmap": "/heatmap/",
-            "risk_grid": "/risk-grid/"
+            "analizar": "POST /analizar",
+            "estadisticas": "POST /estadisticas-csv",
+            "test_api": "GET /api-externa/test"
         }
     }
 
-
-@app.post("/upload-csv/")
-async def upload_csv(file: UploadFile = File(...)):
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(400, "Solo CSV permitido.")
-
-    path = os.path.join(DATA_FOLDER, file.filename)
-
-    with open(path, "wb") as f:
-        contents = await file.read()
-        f.write(contents)
-
-    return {"msg": "CSV subido", "filename": file.filename}
-
-
-@app.post("/train/")
-def train(csv_filename: str):
-    path = os.path.join(DATA_FOLDER, csv_filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "Archivo no encontrado")
-
-    return train_model(path)
-
-
-@app.post("/predict/")
-def predict(payload: dict):
-    try:
-        return predict_row(payload)
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@app.post("/predict-ruta/")
-def predict_ruta(request: RutaRequest):
+@app.post("/analizar")
+async def analizar_accidentes(
+    archivo: UploadFile = File(..., description="Archivo CSV con datos de accidentes"),
+    latitud: float = Form(default=-2.89264),
+    longitud: float = Form(default=-78.77814),
+    radio_km: float = Form(default=5.0)
+):
     """
-    Recibe una ruta como lista de puntos con lat/lng
+    Analiza accidentes combinando datos del CSV cargado y la API externa
+    
+    Args:
+        archivo: Archivo CSV
+        latitud: Latitud del punto de referencia
+        longitud: Longitud del punto de referencia
+        radio_km: Radio de búsqueda en kilómetros
     """
-    # VERIFICAR SI EL MODELO EXISTE
-    if not os.path.exists(MODEL_PATH):
-        raise HTTPException(
-            status_code=400, 
-            detail="El modelo no ha sido entrenado aún. Por favor, entrena el modelo primero desde la sección 'Entrenar IA'."
-        )
-    
     try:
-        model = load_model()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error al cargar el modelo: {str(e)}"
-        )
-    
-    resultados = []
-    
-    for punto in request.ruta:
-        payload = {
-            "latitud_accidente": punto.lat,
-            "longitud_accidente": punto.lng,
-            "numero_victimas": 0,
-            "tipo_accidente": "ruta",
-            "gravedad": "leve",
-            "clima": "normal",
-            "cantón": "Cuenca",
-            "provincia": "Azuay"
-        }
-        try:
-            resultado = predict_row(payload)
-            resultados.append(resultado)
-        except Exception as e:
+        # Validar que sea un archivo CSV
+        if not archivo.filename.endswith('.csv'):
             raise HTTPException(
-                status_code=500,
-                detail=f"Error en la predicción: {str(e)}"
+                status_code=400, 
+                detail="El archivo debe ser un CSV"
             )
-    
-    return {"resultados": resultados}
+        
+        # 1. Leer y procesar el CSV
+        contenido = await archivo.read()
+        
+        if len(contenido) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="El archivo está vacío"
+            )
+        
+        df_csv = pd.read_csv(io.BytesIO(contenido))
+        
+        if len(df_csv) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="El CSV no contiene datos"
+            )
+        
+        # Verificar columnas requeridas
+        required_cols = ['latitud', 'longitud', 'tipo_accidente', 'provincia', 'ciudad']
+        missing_cols = [col for col in required_cols if col not in df_csv.columns]
+        if missing_cols:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Faltan columnas requeridas: {', '.join(missing_cols)}"
+            )
+        
+        datos_csv = procesar_csv(df_csv, latitud, longitud, radio_km)
+        
+        # 2. Consumir la API externa
+        datos_api = []
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    API_BASE_URL,
+                    params={"lat": latitud, "lon": longitud}
+                )
+                
+                if response.status_code == 200:
+                    datos_api = response.json()
+                else:
+                    print(f"⚠️ API externa retornó código {response.status_code}")
+                    
+        except httpx.ConnectError:
+            print("⚠️ No se pudo conectar a la API externa (continuando sin datos de API)")
+        except httpx.TimeoutException:
+            print("⚠️ Timeout al conectar con API externa (continuando sin datos de API)")
+        except Exception as e:
+            print(f"⚠️ Error al consumir API externa: {str(e)} (continuando sin datos de API)")
+        
+        # 3. Combinar y analizar datos
+        resultado = combinar_datos(datos_csv, datos_api, latitud, longitud)
+        
+        return resultado
+        
+    except pd.errors.EmptyDataError:
+        raise HTTPException(status_code=400, detail="El archivo CSV está vacío")
+    except pd.errors.ParserError as e:
+        raise HTTPException(status_code=400, detail=f"Error al parsear CSV: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en el procesamiento: {str(e)}")
 
+@app.post("/estadisticas-csv")
+async def estadisticas_csv(archivo: UploadFile = File(...)):
+    """
+    Obtiene estadísticas básicas del CSV cargado
+    """
+    try:
+        contenido = await archivo.read()
+        df = pd.read_csv(io.BytesIO(contenido))
+        
+        return {
+            "total_registros": len(df),
+            "columnas": list(df.columns),
+            "provincias": df['provincia'].value_counts().to_dict() if 'provincia' in df.columns else {},
+            "ciudades": df['ciudad'].value_counts().head(10).to_dict() if 'ciudad' in df.columns else {},
+            "tipos_accidente": df['tipo_accidente'].value_counts().to_dict() if 'tipo_accidente' in df.columns else {},
+            "fechas": {
+                "min": str(df['fecha'].min()) if 'fecha' in df.columns else None,
+                "max": str(df['fecha'].max()) if 'fecha' in df.columns else None
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-@app.get("/model-status/")
-def model_status():
+@app.get("/api-externa/test")
+async def test_api_externa(lat: float = -2.89264, lon: float = -78.77814):
     """
-    Retorna el estado del modelo
+    Prueba la conexión con la API externa
     """
-    exists = os.path.exists(MODEL_PATH)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                API_BASE_URL,
+                params={"lat": lat, "lon": lon}
+            )
+            response.raise_for_status()
+            data = response.json()
+            return {
+                "status": "success",
+                "total_accidentes": len(data) if isinstance(data, list) else 0,
+                "data": data
+            }
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=502, 
+            detail="No se pudo conectar a la API externa. Verifica que esté corriendo en http://localhost:8080"
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Timeout al conectar con API externa")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Error: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """
+    Verifica el estado de la API
+    """
     return {
-        "model_trained": exists,
-        "model_path": MODEL_PATH,
-        "message": "Modelo entrenado y listo" if exists else "Modelo no entrenado. Entrena el modelo primero."
+        "status": "healthy",
+        "service": "Sistema de Análisis de Accidentes",
+        "version": "1.0"
     }
-
-
-@app.get("/heatmap/")
-def heatmap(csv_filename: str, bins: int = 100):
-    path = os.path.join(DATA_FOLDER, csv_filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "CSV no encontrado")
-
-    df = pd.read_csv(path)
-    buf = generate_heatmap(df, bins)
-
-    tmp = os.path.join(DATA_FOLDER, "heatmap.png")
-    with open(tmp, "wb") as f:
-        f.write(buf.getvalue())
-
-    return FileResponse(tmp, media_type="image/png", filename="heatmap.png")
-
-
-@app.get("/risk-grid/")
-def riskgrid(csv_filename: str):
-    path = os.path.join(DATA_FOLDER, csv_filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "CSV no encontrado")
-
-    df = pd.read_csv(path)
-    grid = risk_grid(df)
-
-    return JSONResponse({"cells": grid})
-
-
-# ------------------------------
-# Rutas seguras (opcional)
-# ------------------------------
-@app.get("/rutas_seguras/")
-def rutas_seguras(destino: str, csv_filename: str = "accidentes_sinteticos_ecuador_cuen.csv"):
-    path = os.path.join(DATA_FOLDER, csv_filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "CSV no encontrado")
-    df = pd.read_csv(path)
-    df["alto_riesgo"] = create_target(df)
-    df_seguro = df[df["alto_riesgo"] == 0]
-
-    if df_seguro.empty:
-        raise HTTPException(404, "No hay rutas seguras disponibles")
-
-    rutas = []
-    for i in range(3):
-        rutas.append({
-            "nombre": f"Ruta segura {i+1}",
-            "camino": [
-                {"lat": -0.170653 + i*0.01, "lng": -78.457834 + i*0.01}
-            ]
-        })
-    return JSONResponse(rutas)
-
-
-# ------------------------------
-# Iniciar servidor
-# ------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
