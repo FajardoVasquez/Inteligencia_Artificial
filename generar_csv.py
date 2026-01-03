@@ -162,7 +162,8 @@ if __name__ == "__main__":
     df = generar_dataset(10000)
     
     # Guardar CSV
-    nombre_archivo = "accidentes_transito_ecuador_10000.csv"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nombre_archivo = f"accidentes_transito_ecuador_{len(df)}_{timestamp}.csv"
     df.to_csv(nombre_archivo, index=False, encoding='utf-8')
     
     print(f"✓ Archivo generado: {nombre_archivo}")
